@@ -25,7 +25,6 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
 
 from core import data as data_mod
 from core import llm as llm_mod
@@ -111,12 +110,11 @@ CUSTOM_CSS = """
         padding: 18px 20px;
     }
 
-    /* Big state word — serif italic for drama. */
+    /* Big state word — bold serif, no italics. */
     .big-metric {
         font-family: var(--serif);
         font-size: 2.4rem;
-        font-weight: 400;
-        font-style: italic;
+        font-weight: 600;
         letter-spacing: -0.01em;
     }
     .state-NORMAL  { color: var(--green); }
@@ -301,199 +299,16 @@ with st.sidebar:
 # Top bar
 # ---------------------------------------------------------------------------
 
-top_cols = st.columns([3, 2, 2, 3])
-top_cols[0].markdown(
-    "<h2 style='margin:0; font-family:var(--serif);'>Subsea Welding Ops</h2>"
-    "<div style='font-family:var(--mono); font-size:11px; color:var(--muted); "
-    "text-transform:uppercase; letter-spacing:0.08em; margin-top:4px;'>"
-    "5G/6G edge · north sea · v0.1"
-    "</div>",
-    unsafe_allow_html=True,
-)
-
-latency_5g = round(random.uniform(1.0, 2.0), 2)
-latency_4g = round(random.uniform(40.0, 60.0), 1)
-top_cols[1].metric(
-    "5G URLLC latency",
-    f"{latency_5g} ms",
-    delta=f"vs 4G {latency_4g} ms",
-    delta_color="inverse",
-)
-
-top_cols[2].metric("Tick", st.session_state.tick)
-
-disaster_active = st.session_state.tick < st.session_state.disaster_until_tick
-if top_cols[3].button(
-    "Trigger Disaster (30 ticks)" if not disaster_active else "Disaster active…",
-    width="stretch",
-    disabled=disaster_active,
-):
-    st.session_state.disaster_until_tick = st.session_state.tick + 30
-    disaster_active = True
-
-
 # ---------------------------------------------------------------------------
-# Tick loop: advance once per autorefresh
+# Chart helpers (module-level; rebuilt inside the fragment on every tick)
 # ---------------------------------------------------------------------------
 
-if st.session_state.running:
-    st_autorefresh(interval=tick_ms, key="tick_refresh")
+_CHART_BG = "#181a1f"
+_CHART_FG = "#e8e6e0"
+_CHART_MUTED = "#b0b0b0"
+_CHART_GRID = "rgba(255,255,255,0.06)"
+_STATION_COLORS = {"A": "#c8f135", "B": "#4cc9f0"}
 
-    st.session_state.tick += 1
-    t = st.session_state.tick
-
-    # Elapsed ticks inside the current disaster window (0 on first storm tick).
-    disaster_window = 30
-    disaster_start = st.session_state.disaster_until_tick - disaster_window
-    disaster_elapsed = max(0, t - disaster_start) if disaster_active else 0
-
-    for station in data_mod.STATIONS:
-        tick = data_mod.make_tick(
-            normal_df, storm_df, t, station,
-            stress_multiplier=stress,
-            disaster_active=disaster_active,
-            disaster_elapsed=disaster_elapsed,
-        )
-
-        prev_weld = st.session_state.weld[station]
-        weld = ml_mod.next_weld_integrity(
-            prev_weld, tick["wave_height"], st.session_state.rng
-        )
-        st.session_state.weld[station] = weld
-
-        lam = ml_mod.compute_lambda(
-            tick["wave_height"], tick["current_velocity"], weld
-        )
-        R = ml_mod.reliability(lam, t_seconds=10.0)  # 10 s display horizon
-        state = clf.predict(
-            tick["wave_height"], tick["current_velocity"],
-            tick["wave_period"], weld,
-        )
-
-        st.session_state.history[station].append(
-            {
-                "tick": t,
-                "wave": tick["wave_height"],
-                "current": tick["current_velocity"],
-                "period": tick["wave_period"],
-                "weld": weld,
-                "lambda": lam,
-                "R": R,
-                "state": state,
-                "source": tick["source"],
-                "strange_geometry": tick.get("strange_geometry", 0),
-            }
-        )
-
-        # Narrate only on state change (keeps chat readable + fast).
-        prev_state = st.session_state.last_state[station]
-        if state != prev_state:
-            drone_line = llm_mod.narrate(
-                "drone", state, tick["wave_height"], tick["current_velocity"],
-                weld, R, latency_5g, use_llm=use_llm, rig=station,
-            )
-            buoy_line = llm_mod.narrate(
-                "buoy", state, tick["wave_height"], tick["current_velocity"],
-                weld, R, latency_5g, use_llm=use_llm, rig=station,
-            )
-            st.session_state.chat[station].append(
-                {"tick": t, "state": state, "drone": drone_line, "buoy": buoy_line}
-            )
-            st.session_state.last_state[station] = state
-
-        # Human-in-the-loop: raise a latched takeover request the first time
-        # the data stream reports anomalous weld geometry. The flag is cleared
-        # only when the operator hits "Acknowledge" on the rig card.
-        if tick.get("strange_geometry", 0) == 1 and not st.session_state.takeover[station]:
-            st.session_state.takeover[station] = True
-            st.session_state.takeover_tick[station] = t
-            drone_line = llm_mod.narrate(
-                "drone", "TAKEOVER", tick["wave_height"], tick["current_velocity"],
-                weld, R, latency_5g, use_llm=use_llm, rig=station,
-            )
-            buoy_line = llm_mod.narrate(
-                "buoy", "TAKEOVER", tick["wave_height"], tick["current_velocity"],
-                weld, R, latency_5g, use_llm=use_llm, rig=station,
-            )
-            st.session_state.chat[station].append(
-                {"tick": t, "state": "TAKEOVER", "drone": drone_line, "buoy": buoy_line}
-            )
-
-
-# ---------------------------------------------------------------------------
-# Human-in-the-loop escalation banner
-# ---------------------------------------------------------------------------
-
-pending_takeovers = [
-    s for s in data_mod.STATIONS if st.session_state.takeover.get(s)
-]
-if pending_takeovers:
-    rig_list = ", ".join(f"Rig {s}" for s in pending_takeovers)
-    st.markdown(
-        f"<div class='hil-banner'>"
-        f"<b>Human takeover requested</b> — {rig_list} · anomalous weld geometry · "
-        f"escalated over URLLC slice"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
-
-
-# ---------------------------------------------------------------------------
-# KPI cards per rig
-# ---------------------------------------------------------------------------
-
-st.markdown("#### Live rig telemetry")
-rig_cols = st.columns(2)
-
-for col, station in zip(rig_cols, data_mod.STATIONS):
-    hist = st.session_state.history[station]
-    if not hist:
-        continue
-    last = hist[-1]
-    state = last["state"]
-    in_takeover = st.session_state.takeover.get(station, False)
-    # TAKEOVER visually supersedes the weather-driven state on the card.
-    display_state = "TAKEOVER" if in_takeover else state
-    source_badge = "storm.csv" if last.get("source") == "storm" else "normal.csv"
-    with col:
-        takeover_badge = (
-            f"<span class='badge state-TAKEOVER'>HIL · takeover · t={st.session_state.takeover_tick[station]}</span> "
-            if in_takeover else ""
-        )
-        st.markdown(
-            f"<div class='rig-card'>"
-            f"<div style='display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;'>"
-            f"  <div>"
-            f"    <span class='badge'>rig · {station}</span> "
-            f"    <span class='badge'>data · {source_badge}</span> "
-            f"    {takeover_badge}"
-            f"  </div>"
-            f"  <span class='state-{display_state} big-metric'>{display_state.lower()}</span>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Reliability R", f"{last['R']:.2f}")
-        k2.metric("λ", f"{last['lambda']:.3f}")
-        k3.metric("Weld", f"{last['weld']:.0f}%")
-        k4.metric("Wave", f"{last['wave']:.2f} m")
-        st.markdown("</div>", unsafe_allow_html=True)
-
-        if in_takeover:
-            if st.button(
-                f"Acknowledge takeover — Rig {station}",
-                key=f"ack_{station}",
-                width="stretch",
-                type="primary",
-            ):
-                st.session_state.takeover[station] = False
-                st.session_state.takeover_tick[station] = None
-                st.rerun()
-
-
-# ---------------------------------------------------------------------------
-# Charts
-# ---------------------------------------------------------------------------
 
 def _combined_df() -> pd.DataFrame:
     frames = []
@@ -505,16 +320,6 @@ def _combined_df() -> pd.DataFrame:
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
-
-
-combined = _combined_df()
-
-# Shared chart styling for the LaunchSafe palette.
-_CHART_BG = "#181a1f"
-_CHART_FG = "#e8e6e0"
-_CHART_MUTED = "#b0b0b0"
-_CHART_GRID = "rgba(255,255,255,0.06)"
-_STATION_COLORS = {"A": "#c8f135", "B": "#4cc9f0"}
 
 
 def _style_fig(fig: go.Figure, title: str, y_range=None) -> None:
@@ -534,66 +339,255 @@ def _style_fig(fig: go.Figure, title: str, y_range=None) -> None:
     )
 
 
-if not combined.empty:
-    ch1, ch2 = st.columns(2)
-
-    fig_wave = go.Figure()
-    for s in data_mod.STATIONS:
-        sub = combined[combined.station == s]
-        fig_wave.add_trace(go.Scatter(
-            x=sub["tick"], y=sub["wave"], mode="lines", name=f"Rig {s}",
-            line=dict(color=_STATION_COLORS.get(s, "#c8f135"), width=2),
-        ))
-    _style_fig(fig_wave, "WAVE HEIGHT (m)")
-    ch1.plotly_chart(fig_wave, width="stretch")
-
-    fig_R = go.Figure()
-    for s in data_mod.STATIONS:
-        sub = combined[combined.station == s]
-        color = _STATION_COLORS.get(s, "#c8f135")
-        fig_R.add_trace(go.Scatter(
-            x=sub["tick"], y=sub["R"], mode="lines", name=f"Rig {s} · R",
-            line=dict(color=color, width=2),
-        ))
-        fig_R.add_trace(go.Scatter(
-            x=sub["tick"], y=sub["weld"] / 100.0, mode="lines",
-            name=f"Rig {s} · weld",
-            line=dict(color=color, width=1, dash="dot"),
-            opacity=0.6,
-        ))
-    _style_fig(fig_R, "RELIABILITY R(t) & WELD INTEGRITY", y_range=[0, 1.05])
-    ch2.plotly_chart(fig_R, width="stretch")
-
-
 # ---------------------------------------------------------------------------
-# Chat columns
+# Live dashboard — a single Streamlit fragment that reruns at ``tick_ms``
+# without triggering a full-page rerun. Everything below the sidebar lives
+# inside here: top bar, HIL banner, KPI cards, charts, chat panels.
 # ---------------------------------------------------------------------------
 
-st.markdown("#### Agent chat log — state transitions only")
-chat_cols = st.columns(2)
-for col, station in zip(chat_cols, data_mod.STATIONS):
-    with col:
+_run_every = (tick_ms / 1000.0) if st.session_state.running else None
+
+
+@st.fragment(run_every=_run_every)
+def live_dashboard() -> None:
+    # --- Advance one tick (only when running) ---------------------------
+    if st.session_state.running:
+        st.session_state.tick += 1
+    t = st.session_state.tick
+
+    latency_5g = round(random.uniform(1.0, 2.0), 2)
+    latency_4g = round(random.uniform(40.0, 60.0), 1)
+
+    # --- Top bar --------------------------------------------------------
+    top_cols = st.columns([3, 2, 2, 3])
+    top_cols[0].markdown(
+        "<h2 style='margin:0; font-family:var(--serif);'>Subsea Welding Ops</h2>"
+        "<div style='font-family:var(--mono); font-size:11px; color:var(--muted); "
+        "text-transform:uppercase; letter-spacing:0.08em; margin-top:4px;'>"
+        "5G/6G edge · north sea · v0.1"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    top_cols[1].metric(
+        "5G URLLC latency",
+        f"{latency_5g} ms",
+        delta=f"vs 4G {latency_4g} ms",
+        delta_color="inverse",
+    )
+    top_cols[2].metric("Tick", t)
+
+    disaster_active = t < st.session_state.disaster_until_tick
+    if top_cols[3].button(
+        "Trigger Disaster (30 ticks)" if not disaster_active else "Disaster active…",
+        width="stretch",
+        disabled=disaster_active,
+        key="disaster_btn",
+    ):
+        st.session_state.disaster_until_tick = t + 30
+        disaster_active = True
+
+    # --- Compute this tick for every station ---------------------------
+    if st.session_state.running:
+        disaster_window = 30
+        disaster_start = st.session_state.disaster_until_tick - disaster_window
+        disaster_elapsed = max(0, t - disaster_start) if disaster_active else 0
+
+        for station in data_mod.STATIONS:
+            tick = data_mod.make_tick(
+                normal_df, storm_df, t, station,
+                stress_multiplier=stress,
+                disaster_active=disaster_active,
+                disaster_elapsed=disaster_elapsed,
+            )
+
+            prev_weld = st.session_state.weld[station]
+            weld = ml_mod.next_weld_integrity(
+                prev_weld, tick["wave_height"], st.session_state.rng
+            )
+            st.session_state.weld[station] = weld
+
+            lam = ml_mod.compute_lambda(
+                tick["wave_height"], tick["current_velocity"], weld
+            )
+            R = ml_mod.reliability(lam, t_seconds=10.0)
+            state = clf.predict(
+                tick["wave_height"], tick["current_velocity"],
+                tick["wave_period"], weld,
+            )
+
+            st.session_state.history[station].append(
+                {
+                    "tick": t,
+                    "wave": tick["wave_height"],
+                    "current": tick["current_velocity"],
+                    "period": tick["wave_period"],
+                    "weld": weld,
+                    "lambda": lam,
+                    "R": R,
+                    "state": state,
+                    "source": tick["source"],
+                    "strange_geometry": tick.get("strange_geometry", 0),
+                }
+            )
+
+            # Narrate on classifier state change.
+            prev_state = st.session_state.last_state[station]
+            if state != prev_state:
+                drone_line = llm_mod.narrate(
+                    "drone", state, tick["wave_height"], tick["current_velocity"],
+                    weld, R, latency_5g, use_llm=use_llm, rig=station,
+                )
+                buoy_line = llm_mod.narrate(
+                    "buoy", state, tick["wave_height"], tick["current_velocity"],
+                    weld, R, latency_5g, use_llm=use_llm, rig=station,
+                )
+                st.session_state.chat[station].append(
+                    {"tick": t, "state": state, "drone": drone_line, "buoy": buoy_line}
+                )
+                st.session_state.last_state[station] = state
+
+            # Latched human-in-the-loop escalation on ``strange_geometry`` flag.
+            if tick.get("strange_geometry", 0) == 1 and not st.session_state.takeover[station]:
+                st.session_state.takeover[station] = True
+                st.session_state.takeover_tick[station] = t
+                drone_line = llm_mod.narrate(
+                    "drone", "TAKEOVER", tick["wave_height"], tick["current_velocity"],
+                    weld, R, latency_5g, use_llm=use_llm, rig=station,
+                )
+                buoy_line = llm_mod.narrate(
+                    "buoy", "TAKEOVER", tick["wave_height"], tick["current_velocity"],
+                    weld, R, latency_5g, use_llm=use_llm, rig=station,
+                )
+                st.session_state.chat[station].append(
+                    {"tick": t, "state": "TAKEOVER", "drone": drone_line, "buoy": buoy_line}
+                )
+
+    # --- HIL escalation banner -----------------------------------------
+    pending_takeovers = [
+        s for s in data_mod.STATIONS if st.session_state.takeover.get(s)
+    ]
+    if pending_takeovers:
+        rig_list = ", ".join(f"Rig {s}" for s in pending_takeovers)
         st.markdown(
-            f"<span class='live-dot'></span> **Rig {station} — drone ⇄ buoy**",
+            f"<div class='hil-banner'>"
+            f"<b>Human takeover requested</b> — {rig_list} · anomalous weld geometry · "
+            f"escalated over URLLC slice"
+            f"</div>",
             unsafe_allow_html=True,
         )
-        panel = st.container(height=420, border=True)
-        msgs = st.session_state.chat[station]
-        if not msgs:
-            panel.caption("Awaiting first state transition…")
-        else:
-            for m in reversed(msgs):
-                extra = " takeover" if m["state"] == "TAKEOVER" else ""
-                panel.markdown(
-                    f"<div class='chat-drone{extra}'><b>drone</b> "
-                    f"<span class='badge state-{m['state']}'>t={m['tick']} · {m['state']}</span><br/>"
-                    f"{m['drone']}</div>",
-                    unsafe_allow_html=True,
-                )
-                panel.markdown(
-                    f"<div class='chat-buoy{extra}'><b>buoy</b><br/>{m['buoy']}</div>",
-                    unsafe_allow_html=True,
-                )
+
+    # --- KPI cards per rig ---------------------------------------------
+    st.markdown("#### Live rig telemetry")
+    rig_cols = st.columns(2)
+    for col, station in zip(rig_cols, data_mod.STATIONS):
+        hist = st.session_state.history[station]
+        if not hist:
+            continue
+        last = hist[-1]
+        state = last["state"]
+        in_takeover = st.session_state.takeover.get(station, False)
+        display_state = "TAKEOVER" if in_takeover else state
+        source_badge = "storm.csv" if last.get("source") == "storm" else "normal.csv"
+        with col:
+            takeover_badge = (
+                f"<span class='badge state-TAKEOVER'>HIL · takeover · "
+                f"t={st.session_state.takeover_tick[station]}</span> "
+                if in_takeover else ""
+            )
+            st.markdown(
+                f"<div class='rig-card'>"
+                f"<div style='display:flex; justify-content:space-between; "
+                f"align-items:center; margin-bottom:10px;'>"
+                f"  <div>"
+                f"    <span class='badge'>rig · {station}</span> "
+                f"    <span class='badge'>data · {source_badge}</span> "
+                f"    {takeover_badge}"
+                f"  </div>"
+                f"  <span class='state-{display_state} big-metric'>"
+                f"{display_state.lower()}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Reliability R", f"{last['R']:.2f}")
+            k2.metric("λ", f"{last['lambda']:.3f}")
+            k3.metric("Weld", f"{last['weld']:.0f}%")
+            k4.metric("Wave", f"{last['wave']:.2f} m")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+            if in_takeover:
+                if st.button(
+                    f"Acknowledge takeover — Rig {station}",
+                    key=f"ack_{station}",
+                    width="stretch",
+                    type="primary",
+                ):
+                    st.session_state.takeover[station] = False
+                    st.session_state.takeover_tick[station] = None
+                    st.rerun(scope="fragment")
+
+    # --- Charts --------------------------------------------------------
+    combined = _combined_df()
+    if not combined.empty:
+        ch1, ch2 = st.columns(2)
+
+        fig_wave = go.Figure()
+        for s in data_mod.STATIONS:
+            sub = combined[combined.station == s]
+            fig_wave.add_trace(go.Scatter(
+                x=sub["tick"], y=sub["wave"], mode="lines", name=f"Rig {s}",
+                line=dict(color=_STATION_COLORS.get(s, "#c8f135"), width=2),
+            ))
+        _style_fig(fig_wave, "WAVE HEIGHT (m)")
+        ch1.plotly_chart(fig_wave, width="stretch", key=f"wave_chart_{t}")
+
+        fig_R = go.Figure()
+        for s in data_mod.STATIONS:
+            sub = combined[combined.station == s]
+            color = _STATION_COLORS.get(s, "#c8f135")
+            fig_R.add_trace(go.Scatter(
+                x=sub["tick"], y=sub["R"], mode="lines", name=f"Rig {s} · R",
+                line=dict(color=color, width=2),
+            ))
+            fig_R.add_trace(go.Scatter(
+                x=sub["tick"], y=sub["weld"] / 100.0, mode="lines",
+                name=f"Rig {s} · weld",
+                line=dict(color=color, width=1, dash="dot"),
+                opacity=0.6,
+            ))
+        _style_fig(fig_R, "RELIABILITY R(t) & WELD INTEGRITY", y_range=[0, 1.05])
+        ch2.plotly_chart(fig_R, width="stretch", key=f"r_chart_{t}")
+
+    # --- Chat panels ---------------------------------------------------
+    st.markdown("#### Agent chat log — state transitions only")
+    chat_cols = st.columns(2)
+    for col, station in zip(chat_cols, data_mod.STATIONS):
+        with col:
+            st.markdown(
+                f"<span class='live-dot'></span> **Rig {station} — drone ⇄ buoy**",
+                unsafe_allow_html=True,
+            )
+            panel = st.container(height=420, border=True)
+            msgs = st.session_state.chat[station]
+            if not msgs:
+                panel.caption("Awaiting first state transition…")
+            else:
+                for m in reversed(msgs):
+                    extra = " takeover" if m["state"] == "TAKEOVER" else ""
+                    panel.markdown(
+                        f"<div class='chat-drone{extra}'><b>drone</b> "
+                        f"<span class='badge state-{m['state']}'>"
+                        f"t={m['tick']} · {m['state']}</span><br/>"
+                        f"{m['drone']}</div>",
+                        unsafe_allow_html=True,
+                    )
+                    panel.markdown(
+                        f"<div class='chat-buoy{extra}'><b>buoy</b><br/>{m['buoy']}</div>",
+                        unsafe_allow_html=True,
+                    )
+
+
+live_dashboard()
 
 st.caption(
     "PoC · Ericsson Hackathon 2026 · Decisions by scikit-learn + R=e^(-λt) · "
