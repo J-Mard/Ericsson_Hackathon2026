@@ -1,9 +1,10 @@
-"""Streamlit dashboard for the 5G/6G underwater welding PoC.
+"""Streamlit dashboard for the 6G subsea welding PoC.
 
-Two simulated North Sea oil rigs (A, B), each with one welding drone
-tethered by fibre to a 5G edge buoy. Marine weather is replayed from a
-local Open-Meteo CSV. A decision tree in ``core.ml`` picks the mission state;
-``core.llm`` narrates transitions into a chat log.
+Two offshore rigs (A, B) on the California Pacific coast, each with a
+welding drone tethered by fibre to a 6G edge buoy. Marine weather is
+replayed from a local Open-Meteo CSV. A decision tree in ``core.ml``
+picks the mission state; ``core.llm`` narrates transitions into a chat
+log so the buoy feels like it's actually talking to the drone.
 
 Run from repo root:
     ollama pull qwen2.5:3b          # optional, for real narration
@@ -35,7 +36,7 @@ from core import ml as ml_mod
 # ---------------------------------------------------------------------------
 
 st.set_page_config(
-    page_title="5G/6G Subsea Welding Ops",
+    page_title="6G Subsea Welding Ops",
     page_icon=None,
     layout="wide",
     initial_sidebar_state="expanded",
@@ -139,6 +140,35 @@ CUSTOM_CSS = """
     }
     .state-TAKEOVER { color: var(--red); }
 
+    /* Session ops-counter strip. */
+    .ops-counters {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin: 6px 0 14px;
+        padding: 8px 14px;
+        background: var(--bg3);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        font-family: var(--mono);
+        font-size: 11px;
+        letter-spacing: 0.06em;
+        color: var(--muted);
+        text-transform: uppercase;
+    }
+    .ops-counters .label { color: var(--muted); }
+    .ops-counters .count {
+        color: var(--text);
+        font-weight: 600;
+        margin-left: 4px;
+    }
+    .ops-counters .sep { opacity: 0.35; }
+    .ops-counters .count.hil     { color: var(--red); }
+    .ops-counters .count.abort   { color: var(--red); }
+    .ops-counters .count.caution { color: var(--yellow); }
+    .ops-counters .count.normal  { color: var(--green); }
+    .ops-counters .count.recov   { color: var(--accent); }
+
     /* Human-in-the-loop escalation banner. */
     .hil-banner {
         background: linear-gradient(90deg, rgba(255,77,77,0.18), rgba(255,77,77,0.05));
@@ -221,24 +251,32 @@ def _init_state() -> None:
     ss.setdefault("disaster_until_tick", -1)
     ss.setdefault("history", {s: [] for s in data_mod.STATIONS})
     ss.setdefault("chat", {s: [] for s in data_mod.STATIONS})
-    ss.setdefault("weld", {s: 92.0 for s in data_mod.STATIONS})
     ss.setdefault("last_state", {s: "NORMAL" for s in data_mod.STATIONS})
     # Latched human-in-the-loop takeover flag per rig. Set when the data stream
     # reports ``strange_geometry=1``; cleared only by an explicit operator
     # acknowledgment on the dashboard.
     ss.setdefault("takeover", {s: False for s in data_mod.STATIONS})
     ss.setdefault("takeover_tick", {s: None for s in data_mod.STATIONS})
+    # Session-wide event tallies for the ops counter strip. ``recoveries``
+    # counts ABORT -> NORMAL transitions only — the system coming back from
+    # an emergency-retreat on its own. CAUTION -> NORMAL is too routine to
+    # be a meaningful pitch metric.
+    ss.setdefault(
+        "counters",
+        {"HIL": 0, "ABORT": 0, "CAUTION": 0, "NORMAL": 0, "recoveries": 0},
+    )
     ss.setdefault("rng", np.random.default_rng(7))
 
 _init_state()
 
 
 @st.cache_data
-def _load_datasets() -> tuple[pd.DataFrame, pd.DataFrame]:
-    return data_mod.load_normal_csv(), data_mod.load_storm_csv()
+def _load_datasets() -> tuple[dict[str, pd.DataFrame], dict[str, pd.DataFrame]]:
+    """Per-rig steady-state feeds + per-rig storm arcs."""
+    return data_mod.load_station_feeds(), data_mod.load_storm_feeds()
 
 
-normal_df, storm_df = _load_datasets()
+station_feeds, storm_feeds = _load_datasets()
 clf = ml_mod.get_classifier()
 
 
@@ -260,19 +298,6 @@ with st.sidebar:
     )
 
     st.divider()
-    st.subheader("Model insights")
-    st.caption("Decision tree — feature importances")
-    imp = clf.feature_importances()
-    st.bar_chart(pd.Series(imp).sort_values(ascending=False))
-
-    st.caption("Reliability model")
-    st.latex(r"R(t) = e^{-\lambda \, t}")
-    st.latex(
-        r"\lambda = 0.05\,H_s + 0.03\,U_c + 0.02\,\frac{100-W}{100}"
-    )
-    st.caption("Hs = wave height (m), Uc = current (m/s), W = weld integrity (%)")
-
-    st.divider()
     c1, c2 = st.columns(2)
     if c1.button(
         "Pause" if st.session_state.running else "Resume",
@@ -284,11 +309,11 @@ with st.sidebar:
             "tick",
             "history",
             "chat",
-            "weld",
             "last_state",
             "disaster_until_tick",
             "takeover",
             "takeover_tick",
+            "counters",
         ):
             st.session_state.pop(key, None)
         _init_state()
@@ -308,6 +333,26 @@ _CHART_FG = "#e8e6e0"
 _CHART_MUTED = "#b0b0b0"
 _CHART_GRID = "rgba(255,255,255,0.06)"
 _STATION_COLORS = {"A": "#c8f135", "B": "#4cc9f0"}
+
+# Display coords for each rig on the fleet map. Deliberately offshore rather
+# than the Open-Meteo sample points in the CSV metadata — those points snap
+# onshore and would put the pins on land at this zoom. The weather data is
+# still sampled from the real coords; these just position the rigs.
+#   Rig A: ~110 km SW of the Golden Gate, well past the Farallones.
+#   Rig B: ~65 km SW of Long Beach, past San Clemente Island in open Pacific.
+RIG_COORDS: dict[str, dict[str, float | str]] = {
+    "A": {"lat": 37.50, "lon": -124.00, "label": "San Francisco offshore"},
+    "B": {"lat": 33.30, "lon": -118.90, "label": "Los Angeles offshore"},
+}
+
+# Map state -> hex colour for the fleet-map pins. TAKEOVER piggybacks on
+# ABORT's red because operationally they're both "do not proceed" signals.
+_STATE_MAP_COLOR = {
+    "NORMAL": "#06d6a0",
+    "CAUTION": "#ffd166",
+    "ABORT": "#ff4d4d",
+    "TAKEOVER": "#ff4d4d",
+}
 
 
 def _combined_df() -> pd.DataFrame:
@@ -339,6 +384,133 @@ def _style_fig(fig: go.Figure, title: str, y_range=None) -> None:
     )
 
 
+def _build_fleet_map(snapshots: dict[str, dict]) -> go.Figure:
+    """Return a scoped Pacific-coast map with one pin per rig.
+
+    ``snapshots`` is keyed by station id and each value is the most recent
+    history row plus a ``takeover`` flag. Missing stations are rendered in a
+    neutral gray so the map still makes sense on tick 0 before any data has
+    flowed through the pipeline.
+    """
+
+    lats: list[float] = []
+    lons: list[float] = []
+    colors: list[str] = []
+    labels: list[str] = []
+    hover: list[str] = []
+
+    takeover_lats: list[float] = []
+    takeover_lons: list[float] = []
+
+    for station in data_mod.STATIONS:
+        coords = RIG_COORDS[station]
+        snap = snapshots.get(station, {}) or {}
+        raw_state = snap.get("state") or "NORMAL"
+        in_takeover = bool(snap.get("takeover"))
+        display_state = "TAKEOVER" if in_takeover else raw_state
+
+        lats.append(float(coords["lat"]))
+        lons.append(float(coords["lon"]))
+        # Fall back to a muted gray when we genuinely have no telemetry yet
+        # so the pin doesn't lie about a healthy state.
+        if not snap:
+            colors.append("#6b6b6b")
+        else:
+            colors.append(_STATE_MAP_COLOR.get(display_state, "#6b6b6b"))
+        labels.append(f"  {station}")
+        hover.append(
+            f"<b>Rig {station}</b> — {coords['label']}<br>"
+            f"state: {display_state}<br>"
+            f"R(t): {snap.get('R', 0.0):.2f}<br>"
+            f"wave: {snap.get('wave', 0.0):.2f} m<br>"
+            f"current: {snap.get('current', 0.0):.2f} m/s<br>"
+            f"source: {snap.get('source', '—')}"
+        )
+
+        if in_takeover:
+            takeover_lats.append(float(coords["lat"]))
+            takeover_lons.append(float(coords["lon"]))
+
+    fig = go.Figure()
+
+    # Backhaul line — a dotted connector between the two buoys. Pure visual
+    # shorthand for "these rigs share a 6G edge mesh", no routing intent.
+    fig.add_trace(
+        go.Scattergeo(
+            lat=[RIG_COORDS["A"]["lat"], RIG_COORDS["B"]["lat"]],
+            lon=[RIG_COORDS["A"]["lon"], RIG_COORDS["B"]["lon"]],
+            mode="lines",
+            line=dict(width=1, color="rgba(200, 241, 53, 0.22)", dash="dot"),
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
+
+    # HIL emphasis ring — drawn before pins so the coloured pin sits on top.
+    if takeover_lats:
+        fig.add_trace(
+            go.Scattergeo(
+                lat=takeover_lats,
+                lon=takeover_lons,
+                mode="markers",
+                marker=dict(
+                    size=52,
+                    color="rgba(255, 77, 77, 0.12)",
+                    line=dict(color="#ff4d4d", width=2),
+                ),
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+
+    # Main rig pins.
+    fig.add_trace(
+        go.Scattergeo(
+            lat=lats,
+            lon=lons,
+            mode="markers+text",
+            text=labels,
+            textposition="middle right",
+            textfont=dict(family="DM Mono, monospace", size=14, color=_CHART_FG),
+            marker=dict(
+                size=26,
+                color=colors,
+                line=dict(color="rgba(0,0,0,0.55)", width=1.5),
+            ),
+            hovertext=hover,
+            hoverinfo="text",
+            showlegend=False,
+        )
+    )
+
+    fig.update_geos(
+        projection_type="mercator",
+        lonaxis_range=[-128, -114],
+        lataxis_range=[30.5, 41.0],
+        showland=True, landcolor="#181a1f",
+        showocean=True, oceancolor="#0e1013",
+        showlakes=True, lakecolor="#0e1013",
+        showcoastlines=True, coastlinecolor="rgba(255,255,255,0.18)",
+        coastlinewidth=0.6,
+        showcountries=False,
+        showframe=False,
+        showsubunits=True, subunitcolor="rgba(255,255,255,0.08)",
+        bgcolor="rgba(0,0,0,0)",
+    )
+    fig.update_layout(
+        margin=dict(l=0, r=0, t=0, b=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        height=540,
+        hoverlabel=dict(
+            bgcolor="#181a1f",
+            bordercolor="rgba(255,255,255,0.12)",
+            font=dict(family="DM Mono, monospace", size=11, color=_CHART_FG),
+        ),
+    )
+    return fig
+
+
 # ---------------------------------------------------------------------------
 # Live dashboard — a single Streamlit fragment that reruns at ``tick_ms``
 # without triggering a full-page rerun. Everything below the sidebar lives
@@ -355,8 +527,13 @@ def live_dashboard() -> None:
         st.session_state.tick += 1
     t = st.session_state.tick
 
-    latency_5g = round(random.uniform(1.0, 2.0), 2)
-    latency_4g = round(random.uniform(40.0, 60.0), 1)
+    # 6G URLLC target: sub-millisecond. We sample 100-500 µs to stay well
+    # under 1 ms while looking plausibly noisy tick-to-tick. The value is
+    # displayed in microseconds on the KPI card for pitch readability and
+    # passed to the LLM prompts in milliseconds so narration still reads
+    # "0.3 ms" rather than "0.0003 s".
+    latency_us = random.randint(100, 500)
+    latency_ms = latency_us / 1000.0
 
     # --- Top bar --------------------------------------------------------
     top_cols = st.columns([3, 2, 2, 3])
@@ -364,16 +541,11 @@ def live_dashboard() -> None:
         "<h2 style='margin:0; font-family:var(--serif);'>Subsea Welding Ops</h2>"
         "<div style='font-family:var(--mono); font-size:11px; color:var(--muted); "
         "text-transform:uppercase; letter-spacing:0.08em; margin-top:4px;'>"
-        "5G/6G edge · north sea · v0.1"
+        "6G edge · pacific coast fleet · v0.1"
         "</div>",
         unsafe_allow_html=True,
     )
-    top_cols[1].metric(
-        "5G URLLC latency",
-        f"{latency_5g} ms",
-        delta=f"vs 4G {latency_4g} ms",
-        delta_color="inverse",
-    )
+    top_cols[1].metric("6G URLLC latency", f"{latency_us} µs")
     top_cols[2].metric("Tick", t)
 
     disaster_active = t < st.session_state.disaster_until_tick
@@ -394,25 +566,18 @@ def live_dashboard() -> None:
 
         for station in data_mod.STATIONS:
             tick = data_mod.make_tick(
-                normal_df, storm_df, t, station,
+                station_feeds, storm_feeds, t, station,
                 stress_multiplier=stress,
                 disaster_active=disaster_active,
                 disaster_elapsed=disaster_elapsed,
             )
 
-            prev_weld = st.session_state.weld[station]
-            weld = ml_mod.next_weld_integrity(
-                prev_weld, tick["wave_height"], st.session_state.rng
-            )
-            st.session_state.weld[station] = weld
-
             lam = ml_mod.compute_lambda(
-                tick["wave_height"], tick["current_velocity"], weld
+                tick["wave_height"], tick["current_velocity"]
             )
             R = ml_mod.reliability(lam, t_seconds=10.0)
             state = clf.predict(
-                tick["wave_height"], tick["current_velocity"],
-                tick["wave_period"], weld,
+                tick["wave_height"], tick["current_velocity"], tick["wave_period"]
             )
 
             st.session_state.history[station].append(
@@ -421,8 +586,6 @@ def live_dashboard() -> None:
                     "wave": tick["wave_height"],
                     "current": tick["current_velocity"],
                     "period": tick["wave_period"],
-                    "weld": weld,
-                    "lambda": lam,
                     "R": R,
                     "state": state,
                     "source": tick["source"],
@@ -433,13 +596,19 @@ def live_dashboard() -> None:
             # Narrate on classifier state change.
             prev_state = st.session_state.last_state[station]
             if state != prev_state:
+                st.session_state.counters[state] = (
+                    st.session_state.counters.get(state, 0) + 1
+                )
+                if state == "NORMAL" and prev_state == "ABORT":
+                    st.session_state.counters["recoveries"] += 1
+
                 drone_line = llm_mod.narrate(
                     "drone", state, tick["wave_height"], tick["current_velocity"],
-                    weld, R, latency_5g, use_llm=use_llm, rig=station,
+                    R, latency_ms, use_llm=use_llm, rig=station,
                 )
                 buoy_line = llm_mod.narrate(
                     "buoy", state, tick["wave_height"], tick["current_velocity"],
-                    weld, R, latency_5g, use_llm=use_llm, rig=station,
+                    R, latency_ms, use_llm=use_llm, rig=station,
                 )
                 st.session_state.chat[station].append(
                     {"tick": t, "state": state, "drone": drone_line, "buoy": buoy_line}
@@ -450,13 +619,14 @@ def live_dashboard() -> None:
             if tick.get("strange_geometry", 0) == 1 and not st.session_state.takeover[station]:
                 st.session_state.takeover[station] = True
                 st.session_state.takeover_tick[station] = t
+                st.session_state.counters["HIL"] += 1
                 drone_line = llm_mod.narrate(
                     "drone", "TAKEOVER", tick["wave_height"], tick["current_velocity"],
-                    weld, R, latency_5g, use_llm=use_llm, rig=station,
+                    R, latency_ms, use_llm=use_llm, rig=station,
                 )
                 buoy_line = llm_mod.narrate(
                     "buoy", "TAKEOVER", tick["wave_height"], tick["current_velocity"],
-                    weld, R, latency_5g, use_llm=use_llm, rig=station,
+                    R, latency_ms, use_llm=use_llm, rig=station,
                 )
                 st.session_state.chat[station].append(
                     {"tick": t, "state": "TAKEOVER", "drone": drone_line, "buoy": buoy_line}
@@ -471,14 +641,61 @@ def live_dashboard() -> None:
         st.markdown(
             f"<div class='hil-banner'>"
             f"<b>Human takeover requested</b> — {rig_list} · anomalous weld geometry · "
-            f"escalated over URLLC slice"
+            f"escalated over 6G URLLC slice"
             f"</div>",
             unsafe_allow_html=True,
         )
 
     # --- KPI cards per rig ---------------------------------------------
+    # --- Session ops counters ------------------------------------------
+    counters = st.session_state.counters
+    st.markdown(
+        "<div class='ops-counters'>"
+        "<span class='label'>session events</span>"
+        "<span class='sep'>·</span>"
+        f"<span>HIL <span class='count hil'>{counters['HIL']}</span></span>"
+        "<span class='sep'>·</span>"
+        f"<span>abort <span class='count abort'>{counters['ABORT']}</span></span>"
+        "<span class='sep'>·</span>"
+        f"<span>caution <span class='count caution'>{counters['CAUTION']}</span></span>"
+        "<span class='sep'>·</span>"
+        f"<span>normal <span class='count normal'>{counters['NORMAL']}</span></span>"
+        "<span class='sep'>→</span>"
+        f"<span>recoveries <span class='count recov'>{counters['recoveries']}</span></span>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    # --- Fleet map ------------------------------------------------------
+    # Both rigs on a single Pacific-coast map. Pin colour tracks the live
+    # classifier state, and an outer red ring marks any rig currently in
+    # Human-in-the-Loop takeover. Rebuilt each fragment tick so the colours
+    # stay in sync with the KPI cards below.
+    map_snapshots: dict[str, dict] = {}
+    for station in data_mod.STATIONS:
+        hist = st.session_state.history.get(station, [])
+        if not hist:
+            continue
+        last = hist[-1]
+        map_snapshots[station] = {
+            "state": last["state"],
+            "R": last["R"],
+            "wave": last["wave"],
+            "current": last["current"],
+            "source": last.get("source", "—"),
+            "takeover": bool(st.session_state.takeover.get(station, False)),
+        }
+    st.markdown("#### Fleet map")
+    st.plotly_chart(
+        _build_fleet_map(map_snapshots),
+        use_container_width=True,
+        key=f"fleet_map_{t}",
+        config={"displayModeBar": False, "scrollZoom": False},
+    )
+
     st.markdown("#### Live rig telemetry")
     rig_cols = st.columns(2)
+    rig_locations = {"A": "san francisco", "B": "los angeles basin"}
     for col, station in zip(rig_cols, data_mod.STATIONS):
         hist = st.session_state.history[station]
         if not hist:
@@ -487,7 +704,11 @@ def live_dashboard() -> None:
         state = last["state"]
         in_takeover = st.session_state.takeover.get(station, False)
         display_state = "TAKEOVER" if in_takeover else state
-        source_badge = "storm.csv" if last.get("source") == "storm" else "normal.csv"
+        src = last.get("source", "")
+        if src.startswith("storm"):
+            source_badge = f"{src}.csv"
+        else:
+            source_badge = "sf_underwater.csv" if station == "A" else "la_underwater.csv"
         with col:
             takeover_badge = (
                 f"<span class='badge state-TAKEOVER'>HIL · takeover · "
@@ -499,7 +720,7 @@ def live_dashboard() -> None:
                 f"<div style='display:flex; justify-content:space-between; "
                 f"align-items:center; margin-bottom:10px;'>"
                 f"  <div>"
-                f"    <span class='badge'>rig · {station}</span> "
+                f"    <span class='badge'>rig · {station} · {rig_locations[station]}</span> "
                 f"    <span class='badge'>data · {source_badge}</span> "
                 f"    {takeover_badge}"
                 f"  </div>"
@@ -508,11 +729,9 @@ def live_dashboard() -> None:
                 f"</div>",
                 unsafe_allow_html=True,
             )
-            k1, k2, k3, k4 = st.columns(4)
+            k1, k2, k3 = st.columns(3)
             k1.metric("Reliability R", f"{last['R']:.2f}")
-            k2.metric("λ", f"{last['lambda']:.3f}")
-            k3.metric("Weld", f"{last['weld']:.0f}%")
-            k4.metric("Wave", f"{last['wave']:.2f} m")
+            k3.metric("Wave", f"{last['wave']:.2f} m")
             st.markdown("</div>", unsafe_allow_html=True)
 
             if in_takeover:
@@ -549,13 +768,7 @@ def live_dashboard() -> None:
                 x=sub["tick"], y=sub["R"], mode="lines", name=f"Rig {s} · R",
                 line=dict(color=color, width=2),
             ))
-            fig_R.add_trace(go.Scatter(
-                x=sub["tick"], y=sub["weld"] / 100.0, mode="lines",
-                name=f"Rig {s} · weld",
-                line=dict(color=color, width=1, dash="dot"),
-                opacity=0.6,
-            ))
-        _style_fig(fig_R, "RELIABILITY R(t) & WELD INTEGRITY", y_range=[0, 1.05])
+        _style_fig(fig_R, "RELIABILITY R(t)", y_range=[0, 1.05])
         ch2.plotly_chart(fig_R, width="stretch", key=f"r_chart_{t}")
 
     # --- Chat panels ---------------------------------------------------
