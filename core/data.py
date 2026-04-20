@@ -37,32 +37,52 @@ STATION_B_NOISE_SIGMA = {
 
 # Tick dict keys (plain dict; documented here for readers):
 #   station, t_index, source, wave_height, current_velocity, wave_period,
-#   sea_surface_temp, disaster_active.
+#   sea_surface_temp, strange_geometry, disaster_active.
+#
+# ``strange_geometry`` (0/1) is a data-driven anomaly flag that, when raised,
+# should trigger a Human-in-the-Loop takeover request on the dashboard.
 
 Tick = dict[str, Any]
 
 
 def _read_marine_csv(path: Path) -> pd.DataFrame:
-    """Shared loader for the Open-Meteo CSV schema.
+    """Shared loader for the Open-Meteo-style marine CSVs.
 
-    Both files use the same two-line metadata header followed by a blank
-    line, so we skip the first 3 rows.
+    Two header formats are supported transparently:
+      * Trimmed form — single header row starting with ``time,`` (used by the
+        main Open-Meteo CSV after the repo cleanup and by ``testing_data.csv``).
+        May include an extra ``strange_geometry`` column.
+      * Raw Open-Meteo export — two lines of metadata, one blank line, then
+        the real header (used by ``storm.csv``). No anomaly column.
     """
 
     if not path.exists():
         raise FileNotFoundError(f"Marine CSV not found at {path}")
 
-    df = pd.read_csv(path, skiprows=3)
-    df.columns = [
-        "time",
-        "wave_height",
-        "current_velocity_kmh",
-        "sea_surface_temp",
-        "wave_period",
-    ]
+    with path.open("r", encoding="utf-8") as fh:
+        first = fh.readline().strip().lower()
+    skiprows = 0 if first.startswith("time,") else 3
+
+    df = pd.read_csv(path, skiprows=skiprows)
+
+    rename = {
+        "time": "time",
+        "wave_height (m)": "wave_height",
+        "ocean_current_velocity (km/h)": "current_velocity_kmh",
+        "sea_surface_temperature (°C)": "sea_surface_temp",
+        "wave_period (s)": "wave_period",
+        "strange_geometry": "strange_geometry",
+    }
+    df = df.rename(columns=rename)
+
     df["time"] = pd.to_datetime(df["time"])
-    # Convert km/h -> m/s so the threshold "> 1 m/s" from the spec works directly.
+    # Convert km/h -> m/s so the spec threshold "> 1 m/s" works directly.
     df["current_velocity"] = df["current_velocity_kmh"] / 3.6
+
+    if "strange_geometry" not in df.columns:
+        df["strange_geometry"] = 0
+    df["strange_geometry"] = df["strange_geometry"].fillna(0).astype(int)
+
     return df.reset_index(drop=True)
 
 
@@ -96,6 +116,7 @@ def _station_row(df: pd.DataFrame, i: int, station: str) -> dict:
             "current_velocity": float(row["current_velocity"]),
             "wave_period": float(row["wave_period"]),
             "sea_surface_temp": float(row["sea_surface_temp"]),
+            "strange_geometry": int(row.get("strange_geometry", 0)),
         }
 
     j = (i + STATION_B_OFFSET_HOURS) % n
@@ -118,6 +139,9 @@ def _station_row(df: pd.DataFrame, i: int, station: str) -> dict:
             + rng.normal(0, STATION_B_NOISE_SIGMA["wave_period"]),
         ),
         "sea_surface_temp": float(row["sea_surface_temp"]),
+        # Anomaly flag is a discrete signal — carry it across verbatim rather
+        # than perturbing it with Gaussian noise.
+        "strange_geometry": int(row.get("strange_geometry", 0)),
     }
 
 
@@ -160,5 +184,6 @@ def make_tick(
         "current_velocity": current,
         "wave_period": raw["wave_period"],
         "sea_surface_temp": raw["sea_surface_temp"],
+        "strange_geometry": int(raw.get("strange_geometry", 0)),
         "disaster_active": disaster_active,
     }

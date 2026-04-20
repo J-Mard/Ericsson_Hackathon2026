@@ -32,6 +32,24 @@ _ROLE_SYSTEM = {
     ),
 }
 
+# When a TAKEOVER is active we replace the base system prompt so the LLM's
+# tone matches a formal human-in-the-loop handover instead of routine chatter.
+_TAKEOVER_SYSTEM = {
+    "drone": (
+        "You are an autonomous welding drone that has just detected anomalous "
+        "weld geometry it cannot resolve safely. "
+        "Issue a ONE-sentence handover request to the human operator over the "
+        "5G control slice. Max 20 words, urgent but calm, reference the rig ID "
+        "and the anomaly. No preamble."
+    ),
+    "buoy": (
+        "You are a 5G edge buoy escalating a welding anomaly to the on-shore "
+        "operations centre. "
+        "Announce the human-in-the-loop takeover in ONE sentence, max 20 words, "
+        "dispatcher tone, mention URLLC slice priority. No preamble."
+    ),
+}
+
 
 
 # ---------------------------------------------------------------------------
@@ -44,14 +62,16 @@ _ROLE_SYSTEM = {
 
 _TEMPLATES: dict[Role, dict[str, str]] = {
     "drone": {
-        "NORMAL":  "[fallback] drone nominal · weld {weld:.0f}% · R={R:.2f}",
-        "CAUTION": "[fallback] drone caution · weld {weld:.0f}% · R={R:.2f}",
-        "ABORT":   "[fallback] drone abort · weld {weld:.0f}% · R={R:.2f}",
+        "NORMAL":   "[fallback] drone nominal · weld {weld:.0f}% · R={R:.2f}",
+        "CAUTION":  "[fallback] drone caution · weld {weld:.0f}% · R={R:.2f}",
+        "ABORT":    "[fallback] drone abort · weld {weld:.0f}% · R={R:.2f}",
+        "TAKEOVER": "[fallback] Rig {rig}: anomalous weld geometry — requesting human takeover.",
     },
     "buoy": {
-        "NORMAL":  "[fallback] link {lat:.1f} ms · wave {wave:.1f} m · current {cur:.1f} m/s",
-        "CAUTION": "[fallback] advisory · wave {wave:.1f} m · current {cur:.1f} m/s",
-        "ABORT":   "[fallback] emergency · wave {wave:.1f} m · current {cur:.1f} m/s",
+        "NORMAL":   "[fallback] link {lat:.1f} ms · wave {wave:.1f} m · current {cur:.1f} m/s",
+        "CAUTION":  "[fallback] advisory · wave {wave:.1f} m · current {cur:.1f} m/s",
+        "ABORT":    "[fallback] emergency · wave {wave:.1f} m · current {cur:.1f} m/s",
+        "TAKEOVER": "[fallback] Rig {rig}: escalating to URLLC takeover slice · operator handover.",
     },
 }
 
@@ -73,17 +93,28 @@ def _try_ollama(role: Role, state: str, ctx: dict) -> str | None:
     except Exception:
         return None
 
-    user = (
-        f"State={state}. Wave={ctx['wave']:.1f}m, current={ctx['cur']:.1f}m/s, "
-        f"weld={ctx['weld']:.0f}%, R={ctx['R']:.2f}, 5G_latency={ctx['lat']:.1f}ms. "
-        "Explain your next action."
-    )
+    is_takeover = state == "TAKEOVER"
+    system_prompt = (_TAKEOVER_SYSTEM if is_takeover else _ROLE_SYSTEM)[role]
+
+    if is_takeover:
+        user = (
+            f"Rig {ctx['rig']}: anomalous weld geometry detected. "
+            f"Telemetry — wave={ctx['wave']:.1f}m, current={ctx['cur']:.1f}m/s, "
+            f"weld={ctx['weld']:.0f}%, R={ctx['R']:.2f}, "
+            f"5G_latency={ctx['lat']:.1f}ms. Issue the handover."
+        )
+    else:
+        user = (
+            f"State={state}. Wave={ctx['wave']:.1f}m, current={ctx['cur']:.1f}m/s, "
+            f"weld={ctx['weld']:.0f}%, R={ctx['R']:.2f}, 5G_latency={ctx['lat']:.1f}ms. "
+            "Explain your next action."
+        )
 
     try:
         resp = ollama.chat(  
             model=OLLAMA_MODEL,
             messages=[
-                {"role": "system", "content": _ROLE_SYSTEM[role]},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user},
             ],
             options={"num_predict": 60, "temperature": 0.5},
@@ -109,11 +140,14 @@ def narrate(
     R: float,
     latency_ms: float,
     use_llm: bool = True,
+    rig: str = "",
 ) -> str:
     """One-sentence narration for the chat log.
 
-    ``use_llm=False`` forces the template path (handy for offline demos or to
-    cut latency when ticking fast).
+    ``state`` accepts ``NORMAL`` / ``CAUTION`` / ``ABORT`` (from the classifier)
+    and the special ``TAKEOVER`` pseudo-state, which is triggered when the
+    ``strange_geometry`` anomaly flag is raised and requires a human-in-the-loop
+    handover. ``use_llm=False`` forces the template path.
     """
 
     ctx = {
@@ -122,6 +156,7 @@ def narrate(
         "weld": float(weld),
         "R": float(R),
         "lat": float(latency_ms),
+        "rig": rig,
     }
 
     if use_llm:
