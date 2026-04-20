@@ -1,0 +1,7 @@
+streamlit>=1.36
+streamlit-autorefresh>=1.0.1
+pandas>=2.2
+numpy>=1.26
+scikit-learn>=1.5
+plotly>=5.22
+ollama>=0.3
