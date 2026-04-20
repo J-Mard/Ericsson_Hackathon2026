@@ -20,15 +20,15 @@ OLLAMA_TIMEOUT_S = 3.0
 
 _ROLE_SYSTEM = {
     "drone": (
-        "You are an autonomous underwater welding drone on a North Sea oil rig, "
-        "tethered by fibre to a 5G edge buoy. "
+        "You are an autonomous underwater welding drone on a Pacific-coast oil "
+        "rig, tethered by fibre to a 6G AI-native edge buoy. "
         "Reply in ONE sentence, max 18 words, crisp technical radio tone. "
         "No preamble, no pleasantries. Reference the telemetry numbers."
     ),
     "buoy": (
-        "You are a 5G edge buoy coordinating a welding drone on the rig beneath you. "
+        "You are a 6G edge buoy coordinating a welding drone on the rig beneath you. "
         "Reply in ONE sentence, max 18 words, dispatcher tone. "
-        "No preamble, no pleasantries. Mention sea state or network slice priority."
+        "No preamble, no pleasantries. Mention sea state or 6G URLLC slice priority."
     ),
 }
 
@@ -39,12 +39,12 @@ _TAKEOVER_SYSTEM = {
         "You are an autonomous welding drone that has just detected anomalous "
         "weld geometry it cannot resolve safely. "
         "Issue a ONE-sentence handover request to the human operator over the "
-        "5G control slice. Max 20 words, urgent but calm, reference the rig ID "
-        "and the anomaly. No preamble."
+        "6G URLLC control slice. Max 20 words, urgent but calm, reference the rig "
+        "ID and the anomaly. No preamble."
     ),
     "buoy": (
-        "You are a 5G edge buoy escalating a welding anomaly to the on-shore "
-        "operations centre. "
+        "You are a 6G edge buoy escalating a welding anomaly to the on-shore "
+        "operations centre over a sub-millisecond URLLC slice. "
         "Announce the human-in-the-loop takeover in ONE sentence, max 20 words, "
         "dispatcher tone, mention URLLC slice priority. No preamble."
     ),
@@ -68,7 +68,7 @@ _TEMPLATES: dict[Role, dict[str, str]] = {
         "TAKEOVER": "[fallback] Rig {rig}: anomalous weld geometry — requesting human takeover.",
     },
     "buoy": {
-        "NORMAL":   "[fallback] link {lat:.1f} ms · wave {wave:.1f} m · current {cur:.1f} m/s",
+        "NORMAL":   "[fallback] link {lat:.2f} ms · wave {wave:.1f} m · current {cur:.1f} m/s",
         "CAUTION":  "[fallback] advisory · wave {wave:.1f} m · current {cur:.1f} m/s",
         "ABORT":    "[fallback] emergency · wave {wave:.1f} m · current {cur:.1f} m/s",
         "TAKEOVER": "[fallback] Rig {rig}: escalating to URLLC takeover slice · operator handover.",
@@ -100,13 +100,13 @@ def _try_ollama(role: Role, state: str, ctx: dict) -> str | None:
         user = (
             f"Rig {ctx['rig']}: anomalous weld geometry detected. "
             f"Telemetry — wave={ctx['wave']:.1f}m, current={ctx['cur']:.1f}m/s, "
-            f"R={ctx['R']:.2f}, 5G_latency={ctx['lat']:.1f}ms. "
+            f"R={ctx['R']:.2f}, 6G_latency={ctx['lat']:.2f}ms. "
             "Issue the handover."
         )
     else:
         user = (
             f"State={state}. Wave={ctx['wave']:.1f}m, current={ctx['cur']:.1f}m/s, "
-            f"R={ctx['R']:.2f}, 5G_latency={ctx['lat']:.1f}ms. "
+            f"R={ctx['R']:.2f}, 6G_latency={ctx['lat']:.2f}ms. "
             "Explain your next action."
         )
 

@@ -1,13 +1,18 @@
-"""Marine-weather replay for two independent oil rigs.
+"""Marine-weather replay for two independent Pacific-coast rigs.
 
-Three CSVs back the simulation:
+Four CSVs back the simulation:
 
-  * ``NORMAL_CSV``  — real Open-Meteo marine data for **Rig A** (North Sea).
-  * ``LA_CSV``      — real Open-Meteo marine data for **Rig B** (LA basin).
+  * ``NORMAL_CSV``   — real Open-Meteo marine data for **Rig A** (SF offshore).
+  * ``LA_CSV``       — real Open-Meteo marine data for **Rig B** (LA basin).
     Entirely independent from Rig A, so the two dashboards diverge naturally
     without us having to synthesise noise.
-  * ``STORM_CSV``   — hand-crafted 30-hour storm arc shared by both rigs
+  * ``STORM_SF_CSV`` — hand-crafted 30-hour oscillating storm arc for Rig A
     while the Disaster button is active.
+  * ``STORM_LA_CSV`` — the same storm system as seen from Rig B: phase-lagged
+    roughly one hour, with slightly lower peaks to reflect the partial
+    Channel-Islands shelter. Different enough that the two dashboards tell
+    subtly different stories during Disaster, similar enough that it reads
+    as one weather event.
 """
 
 from __future__ import annotations
@@ -20,7 +25,8 @@ import pandas as pd
 REPO_ROOT = Path(__file__).resolve().parent.parent
 NORMAL_CSV = REPO_ROOT / "open-meteo-37.79N122.46W18m.csv"
 LA_CSV = REPO_ROOT / "LA_underwater_data.csv"
-STORM_CSV = REPO_ROOT / "storm.csv"
+STORM_SF_CSV = REPO_ROOT / "storm_sf.csv"
+STORM_LA_CSV = REPO_ROOT / "storm_la.csv"
 
 STATIONS = ("A", "B")
 
@@ -28,6 +34,24 @@ STATIONS = ("A", "B")
 STATION_SOURCES = {
     "A": NORMAL_CSV,
     "B": LA_CSV,
+}
+
+# Per-station storm feed for Disaster mode. Each rig gets its own storm CSV
+# so the fleet map / KPI cards / chat diverge realistically even under the
+# same weather event.
+STATION_STORM_SOURCES = {
+    "A": STORM_SF_CSV,
+    "B": STORM_LA_CSV,
+}
+
+# Per-station replay cursor offset, in rows. The LA basin CSV spends its
+# first ~20 rows almost perfectly flat (wave ~0.74 m, current ~0.11 m/s),
+# which makes Rig B look inert for the opening minute of the demo. We fast-
+# forward its cursor a bit so the graphs move from tick 0 and the first
+# ``strange_geometry`` trip hits early enough to tell a story.
+STATION_START_OFFSET = {
+    "A": 0,
+    "B": 20,
 }
 
 # Tick dict keys (plain dict; documented here for readers):
@@ -45,11 +69,11 @@ def _read_marine_csv(path: Path) -> pd.DataFrame:
 
     Two header formats are supported transparently:
       * Trimmed form — single header row starting with ``time,`` (used by the
-        main Open-Meteo CSV after the repo cleanup and by ``testing_data.csv``).
-        May include an extra ``strange_geometry`` column.
+        SF feed, the hand-crafted storm CSVs, and ``testing_data.csv``). May
+        include an extra ``strange_geometry`` column.
       * Raw Open-Meteo export — two lines of metadata, one blank line, then
-        the real header (used by ``LA_underwater_data.csv`` and ``storm.csv``).
-        No anomaly column.
+        the real header (used by ``LA_underwater_data.csv``). No anomaly
+        column.
     """
 
     if not path.exists():
@@ -92,16 +116,19 @@ def load_la_csv(path: Path = LA_CSV) -> pd.DataFrame:
     return _read_marine_csv(path)
 
 
-def load_storm_csv(path: Path = STORM_CSV) -> pd.DataFrame:
-    """Hand-crafted storm timeline — shared by both rigs during Disaster mode."""
-    return _read_marine_csv(path)
-
-
 def load_station_feeds() -> dict[str, pd.DataFrame]:
     """Map each station id to its dedicated steady-state dataframe."""
     return {
         "A": load_normal_csv(),
         "B": load_la_csv(),
+    }
+
+
+def load_storm_feeds() -> dict[str, pd.DataFrame]:
+    """Map each station id to its dedicated Disaster-mode storm dataframe."""
+    return {
+        station: _read_marine_csv(path)
+        for station, path in STATION_STORM_SOURCES.items()
     }
 
 
@@ -123,7 +150,7 @@ def _row(df: pd.DataFrame, i: int) -> dict:
 
 def make_tick(
     station_feeds: dict[str, pd.DataFrame],
-    storm_df: pd.DataFrame,
+    storm_feeds: dict[str, pd.DataFrame],
     t_index: int,
     station: str,
     *,
@@ -134,20 +161,26 @@ def make_tick(
     """Produce one tick dict for the given station.
 
     Under steady-state we pull from ``station_feeds[station]`` at
-    ``t_index``. When ``disaster_active`` is True every station switches
-    to ``storm_df`` indexed by ``disaster_elapsed`` so the storm arc plays
-    from the start each time the operator triggers Disaster.
+    ``t_index``. When ``disaster_active`` is True each station switches to
+    its own ``storm_feeds[station]`` indexed by ``disaster_elapsed`` so the
+    storm arc plays from the start each time the operator triggers Disaster
+    — and Rig A / Rig B see related-but-distinct weather.
 
     ``stress_multiplier`` still applies on top — a great way to push a
     benign day into CAUTION on stage without triggering a full storm.
+
+    ``source`` on the returned tick is ``"normal"`` during steady-state and
+    ``"storm_sf"`` / ``"storm_la"`` during Disaster so the UI badges can
+    show which file is driving each rig.
     """
 
     if disaster_active:
-        raw = _row(storm_df, disaster_elapsed)
-        source = "storm"
+        raw = _row(storm_feeds[station], disaster_elapsed)
+        source = "storm_sf" if station == "A" else "storm_la"
     else:
         feed = station_feeds[station]
-        raw = _row(feed, t_index)
+        offset = STATION_START_OFFSET.get(station, 0)
+        raw = _row(feed, t_index + offset)
         source = "normal"
 
     wave = raw["wave_height"] * stress_multiplier
