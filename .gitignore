@@ -1,0 +1,28 @@
+# Python bytecode / build artefacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+core/__pycache__
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Streamlit cache / secrets
+.streamlit/secrets.toml
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Misc
+*.log
