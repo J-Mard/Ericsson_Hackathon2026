@@ -139,6 +139,35 @@ CUSTOM_CSS = """
     }
     .state-TAKEOVER { color: var(--red); }
 
+    /* Session ops-counter strip. */
+    .ops-counters {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin: 6px 0 14px;
+        padding: 8px 14px;
+        background: var(--bg3);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        font-family: var(--mono);
+        font-size: 11px;
+        letter-spacing: 0.06em;
+        color: var(--muted);
+        text-transform: uppercase;
+    }
+    .ops-counters .label { color: var(--muted); }
+    .ops-counters .count {
+        color: var(--text);
+        font-weight: 600;
+        margin-left: 4px;
+    }
+    .ops-counters .sep { opacity: 0.35; }
+    .ops-counters .count.hil     { color: var(--red); }
+    .ops-counters .count.abort   { color: var(--red); }
+    .ops-counters .count.caution { color: var(--yellow); }
+    .ops-counters .count.normal  { color: var(--green); }
+    .ops-counters .count.recov   { color: var(--accent); }
+
     /* Human-in-the-loop escalation banner. */
     .hil-banner {
         background: linear-gradient(90deg, rgba(255,77,77,0.18), rgba(255,77,77,0.05));
@@ -221,24 +250,32 @@ def _init_state() -> None:
     ss.setdefault("disaster_until_tick", -1)
     ss.setdefault("history", {s: [] for s in data_mod.STATIONS})
     ss.setdefault("chat", {s: [] for s in data_mod.STATIONS})
-    ss.setdefault("weld", {s: 92.0 for s in data_mod.STATIONS})
     ss.setdefault("last_state", {s: "NORMAL" for s in data_mod.STATIONS})
     # Latched human-in-the-loop takeover flag per rig. Set when the data stream
     # reports ``strange_geometry=1``; cleared only by an explicit operator
     # acknowledgment on the dashboard.
     ss.setdefault("takeover", {s: False for s in data_mod.STATIONS})
     ss.setdefault("takeover_tick", {s: None for s in data_mod.STATIONS})
+    # Session-wide event tallies for the ops counter strip. ``recoveries``
+    # counts ABORT -> NORMAL transitions only — the system coming back from
+    # an emergency-retreat on its own. CAUTION -> NORMAL is too routine to
+    # be a meaningful pitch metric.
+    ss.setdefault(
+        "counters",
+        {"HIL": 0, "ABORT": 0, "CAUTION": 0, "NORMAL": 0, "recoveries": 0},
+    )
     ss.setdefault("rng", np.random.default_rng(7))
 
 _init_state()
 
 
 @st.cache_data
-def _load_datasets() -> tuple[pd.DataFrame, pd.DataFrame]:
-    return data_mod.load_normal_csv(), data_mod.load_storm_csv()
+def _load_datasets() -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
+    """Per-rig steady-state feeds + shared storm arc."""
+    return data_mod.load_station_feeds(), data_mod.load_storm_csv()
 
 
-normal_df, storm_df = _load_datasets()
+station_feeds, storm_df = _load_datasets()
 clf = ml_mod.get_classifier()
 
 
@@ -260,19 +297,6 @@ with st.sidebar:
     )
 
     st.divider()
-    st.subheader("Model insights")
-    st.caption("Decision tree — feature importances")
-    imp = clf.feature_importances()
-    st.bar_chart(pd.Series(imp).sort_values(ascending=False))
-
-    st.caption("Reliability model")
-    st.latex(r"R(t) = e^{-\lambda \, t}")
-    st.latex(
-        r"\lambda = 0.05\,H_s + 0.03\,U_c + 0.02\,\frac{100-W}{100}"
-    )
-    st.caption("Hs = wave height (m), Uc = current (m/s), W = weld integrity (%)")
-
-    st.divider()
     c1, c2 = st.columns(2)
     if c1.button(
         "Pause" if st.session_state.running else "Resume",
@@ -284,11 +308,11 @@ with st.sidebar:
             "tick",
             "history",
             "chat",
-            "weld",
             "last_state",
             "disaster_until_tick",
             "takeover",
             "takeover_tick",
+            "counters",
         ):
             st.session_state.pop(key, None)
         _init_state()
@@ -356,7 +380,6 @@ def live_dashboard() -> None:
     t = st.session_state.tick
 
     latency_5g = round(random.uniform(1.0, 2.0), 2)
-    latency_4g = round(random.uniform(40.0, 60.0), 1)
 
     # --- Top bar --------------------------------------------------------
     top_cols = st.columns([3, 2, 2, 3])
@@ -364,16 +387,11 @@ def live_dashboard() -> None:
         "<h2 style='margin:0; font-family:var(--serif);'>Subsea Welding Ops</h2>"
         "<div style='font-family:var(--mono); font-size:11px; color:var(--muted); "
         "text-transform:uppercase; letter-spacing:0.08em; margin-top:4px;'>"
-        "5G/6G edge · north sea · v0.1"
+        "5G/6G edge · north sea + la basin · v0.1"
         "</div>",
         unsafe_allow_html=True,
     )
-    top_cols[1].metric(
-        "5G URLLC latency",
-        f"{latency_5g} ms",
-        delta=f"vs 4G {latency_4g} ms",
-        delta_color="inverse",
-    )
+    top_cols[1].metric("5G URLLC latency", f"{latency_5g} ms")
     top_cols[2].metric("Tick", t)
 
     disaster_active = t < st.session_state.disaster_until_tick
@@ -394,25 +412,18 @@ def live_dashboard() -> None:
 
         for station in data_mod.STATIONS:
             tick = data_mod.make_tick(
-                normal_df, storm_df, t, station,
+                station_feeds, storm_df, t, station,
                 stress_multiplier=stress,
                 disaster_active=disaster_active,
                 disaster_elapsed=disaster_elapsed,
             )
 
-            prev_weld = st.session_state.weld[station]
-            weld = ml_mod.next_weld_integrity(
-                prev_weld, tick["wave_height"], st.session_state.rng
-            )
-            st.session_state.weld[station] = weld
-
             lam = ml_mod.compute_lambda(
-                tick["wave_height"], tick["current_velocity"], weld
+                tick["wave_height"], tick["current_velocity"]
             )
             R = ml_mod.reliability(lam, t_seconds=10.0)
             state = clf.predict(
-                tick["wave_height"], tick["current_velocity"],
-                tick["wave_period"], weld,
+                tick["wave_height"], tick["current_velocity"], tick["wave_period"]
             )
 
             st.session_state.history[station].append(
@@ -421,8 +432,6 @@ def live_dashboard() -> None:
                     "wave": tick["wave_height"],
                     "current": tick["current_velocity"],
                     "period": tick["wave_period"],
-                    "weld": weld,
-                    "lambda": lam,
                     "R": R,
                     "state": state,
                     "source": tick["source"],
@@ -433,13 +442,19 @@ def live_dashboard() -> None:
             # Narrate on classifier state change.
             prev_state = st.session_state.last_state[station]
             if state != prev_state:
+                st.session_state.counters[state] = (
+                    st.session_state.counters.get(state, 0) + 1
+                )
+                if state == "NORMAL" and prev_state == "ABORT":
+                    st.session_state.counters["recoveries"] += 1
+
                 drone_line = llm_mod.narrate(
                     "drone", state, tick["wave_height"], tick["current_velocity"],
-                    weld, R, latency_5g, use_llm=use_llm, rig=station,
+                    R, latency_5g, use_llm=use_llm, rig=station,
                 )
                 buoy_line = llm_mod.narrate(
                     "buoy", state, tick["wave_height"], tick["current_velocity"],
-                    weld, R, latency_5g, use_llm=use_llm, rig=station,
+                    R, latency_5g, use_llm=use_llm, rig=station,
                 )
                 st.session_state.chat[station].append(
                     {"tick": t, "state": state, "drone": drone_line, "buoy": buoy_line}
@@ -450,13 +465,14 @@ def live_dashboard() -> None:
             if tick.get("strange_geometry", 0) == 1 and not st.session_state.takeover[station]:
                 st.session_state.takeover[station] = True
                 st.session_state.takeover_tick[station] = t
+                st.session_state.counters["HIL"] += 1
                 drone_line = llm_mod.narrate(
                     "drone", "TAKEOVER", tick["wave_height"], tick["current_velocity"],
-                    weld, R, latency_5g, use_llm=use_llm, rig=station,
+                    R, latency_5g, use_llm=use_llm, rig=station,
                 )
                 buoy_line = llm_mod.narrate(
                     "buoy", "TAKEOVER", tick["wave_height"], tick["current_velocity"],
-                    weld, R, latency_5g, use_llm=use_llm, rig=station,
+                    R, latency_5g, use_llm=use_llm, rig=station,
                 )
                 st.session_state.chat[station].append(
                     {"tick": t, "state": "TAKEOVER", "drone": drone_line, "buoy": buoy_line}
@@ -477,8 +493,28 @@ def live_dashboard() -> None:
         )
 
     # --- KPI cards per rig ---------------------------------------------
+    # --- Session ops counters ------------------------------------------
+    counters = st.session_state.counters
+    st.markdown(
+        "<div class='ops-counters'>"
+        "<span class='label'>session events</span>"
+        "<span class='sep'>·</span>"
+        f"<span>HIL <span class='count hil'>{counters['HIL']}</span></span>"
+        "<span class='sep'>·</span>"
+        f"<span>abort <span class='count abort'>{counters['ABORT']}</span></span>"
+        "<span class='sep'>·</span>"
+        f"<span>caution <span class='count caution'>{counters['CAUTION']}</span></span>"
+        "<span class='sep'>·</span>"
+        f"<span>normal <span class='count normal'>{counters['NORMAL']}</span></span>"
+        "<span class='sep'>→</span>"
+        f"<span>recoveries <span class='count recov'>{counters['recoveries']}</span></span>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
     st.markdown("#### Live rig telemetry")
     rig_cols = st.columns(2)
+    rig_locations = {"A": "north sea", "B": "la basin"}
     for col, station in zip(rig_cols, data_mod.STATIONS):
         hist = st.session_state.history[station]
         if not hist:
@@ -487,7 +523,10 @@ def live_dashboard() -> None:
         state = last["state"]
         in_takeover = st.session_state.takeover.get(station, False)
         display_state = "TAKEOVER" if in_takeover else state
-        source_badge = "storm.csv" if last.get("source") == "storm" else "normal.csv"
+        if last.get("source") == "storm":
+            source_badge = "storm.csv"
+        else:
+            source_badge = "sf_underwater.csv" if station == "A" else "la_underwater.csv"
         with col:
             takeover_badge = (
                 f"<span class='badge state-TAKEOVER'>HIL · takeover · "
@@ -499,7 +538,7 @@ def live_dashboard() -> None:
                 f"<div style='display:flex; justify-content:space-between; "
                 f"align-items:center; margin-bottom:10px;'>"
                 f"  <div>"
-                f"    <span class='badge'>rig · {station}</span> "
+                f"    <span class='badge'>rig · {station} · {rig_locations[station]}</span> "
                 f"    <span class='badge'>data · {source_badge}</span> "
                 f"    {takeover_badge}"
                 f"  </div>"
@@ -508,11 +547,9 @@ def live_dashboard() -> None:
                 f"</div>",
                 unsafe_allow_html=True,
             )
-            k1, k2, k3, k4 = st.columns(4)
+            k1, k2, k3 = st.columns(3)
             k1.metric("Reliability R", f"{last['R']:.2f}")
-            k2.metric("λ", f"{last['lambda']:.3f}")
-            k3.metric("Weld", f"{last['weld']:.0f}%")
-            k4.metric("Wave", f"{last['wave']:.2f} m")
+            k3.metric("Wave", f"{last['wave']:.2f} m")
             st.markdown("</div>", unsafe_allow_html=True)
 
             if in_takeover:
@@ -549,13 +586,7 @@ def live_dashboard() -> None:
                 x=sub["tick"], y=sub["R"], mode="lines", name=f"Rig {s} · R",
                 line=dict(color=color, width=2),
             ))
-            fig_R.add_trace(go.Scatter(
-                x=sub["tick"], y=sub["weld"] / 100.0, mode="lines",
-                name=f"Rig {s} · weld",
-                line=dict(color=color, width=1, dash="dot"),
-                opacity=0.6,
-            ))
-        _style_fig(fig_R, "RELIABILITY R(t) & WELD INTEGRITY", y_range=[0, 1.05])
+        _style_fig(fig_R, "RELIABILITY R(t)", y_range=[0, 1.05])
         ch2.plotly_chart(fig_R, width="stretch", key=f"r_chart_{t}")
 
     # --- Chat panels ---------------------------------------------------

@@ -62,9 +62,9 @@ _TAKEOVER_SYSTEM = {
 
 _TEMPLATES: dict[Role, dict[str, str]] = {
     "drone": {
-        "NORMAL":   "[fallback] drone nominal · weld {weld:.0f}% · R={R:.2f}",
-        "CAUTION":  "[fallback] drone caution · weld {weld:.0f}% · R={R:.2f}",
-        "ABORT":    "[fallback] drone abort · weld {weld:.0f}% · R={R:.2f}",
+        "NORMAL":   "[fallback] drone nominal · wave {wave:.1f} m · R={R:.2f}",
+        "CAUTION":  "[fallback] drone caution · wave {wave:.1f} m · R={R:.2f}",
+        "ABORT":    "[fallback] drone abort · wave {wave:.1f} m · R={R:.2f}",
         "TAKEOVER": "[fallback] Rig {rig}: anomalous weld geometry — requesting human takeover.",
     },
     "buoy": {
@@ -100,13 +100,13 @@ def _try_ollama(role: Role, state: str, ctx: dict) -> str | None:
         user = (
             f"Rig {ctx['rig']}: anomalous weld geometry detected. "
             f"Telemetry — wave={ctx['wave']:.1f}m, current={ctx['cur']:.1f}m/s, "
-            f"weld={ctx['weld']:.0f}%, R={ctx['R']:.2f}, "
-            f"5G_latency={ctx['lat']:.1f}ms. Issue the handover."
+            f"R={ctx['R']:.2f}, 5G_latency={ctx['lat']:.1f}ms. "
+            "Issue the handover."
         )
     else:
         user = (
             f"State={state}. Wave={ctx['wave']:.1f}m, current={ctx['cur']:.1f}m/s, "
-            f"weld={ctx['weld']:.0f}%, R={ctx['R']:.2f}, 5G_latency={ctx['lat']:.1f}ms. "
+            f"R={ctx['R']:.2f}, 5G_latency={ctx['lat']:.1f}ms. "
             "Explain your next action."
         )
 
@@ -136,7 +136,6 @@ def narrate(
     state: str,
     wave: float,
     current: float,
-    weld: float,
     R: float,
     latency_ms: float,
     use_llm: bool = True,
@@ -153,7 +152,6 @@ def narrate(
     ctx = {
         "wave": float(wave),
         "cur": float(current),
-        "weld": float(weld),
         "R": float(R),
         "lat": float(latency_ms),
         "rig": rig,
